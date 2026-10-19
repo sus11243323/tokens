@@ -1,0 +1,12 @@
+{
+  "name": "steam-cs2-discord-updates",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scheduled Steam and CS2 Discord webhook news/status notifier",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
