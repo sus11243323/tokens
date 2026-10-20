@@ -1,250 +1,210 @@
 const fs = require("node:fs/promises");
 
-const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const STATE_FILE = process.env.STATE_FILE || "state.json";
-const FIRST_RUN_MODE = process.env.FIRST_RUN_MODE || "seed"; // seed = don't post old articles
-const MAX_NEWS_PER_FEED = Number(process.env.MAX_NEWS_PER_FEED || 15);
-const USER_AGENT = "SteamCS2DiscordUpdatesBot/1.0 (personal community bot)";
+const FIRST_RUN_MODE = process.env.FIRST_RUN_MODE || "seed";
+const UA = "SteamDB-CS2-Update-Radar/2.0";
 
-if (!WEBHOOK_URL) {
-  console.error("Missing DISCORD_WEBHOOK_URL environment secret.");
+if (!WEBHOOK) {
+  console.error("Missing DISCORD_WEBHOOK_URL repository secret.");
   process.exit(1);
 }
 
-const SOURCES = [
+const targets = [
   {
-    name: "CS2 updates",
-    type: "steam",
-    url: "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=730&count=20&maxlength=0",
-    category: "CS2 Patch / News",
+    key: "cs2", name: "Counter-Strike 2", emoji: "🎯", color: 0xf0a22e, appid: 730,
+    db: "https://steamdb.info/app/730/patchnotes/",
+    history: "https://steamdb.info/app/730/history/",
+    official: "https://steamcommunity.com/app/730/announcements/"
   },
   {
-    name: "Steam news",
-    type: "steam",
-    url: "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid= steam&count=20&maxlength=0",
-    category: "Steam News",
-    // The Steam client app news endpoint is configured below with its numeric app ID.
-    appId:  steamAppId(),
-  },
-  {
-    name: "CS2 esports",
-    type: "rss",
-    url: "https://news.google.com/rss/search?q=Counter-Strike+2+esports+OR+CS2+esports&hl=en-US&gl=US&ceid=US:en",
-    category: "CS2 Esports",
-  },
+    key: "steamClient", name: "Steam Client", emoji: "🖥️", color: 0x66c0f4, appid: 250,
+    db: "https://steamdb.info/app/250/patchnotes/",
+    history: "https://steamdb.info/app/250/history/",
+    official: "https://store.steampowered.com/news/app/250"
+  }
 ];
 
-function steamAppId() {
-  // Steam client app ID is 753; news is not consistently curated there, so this feed
-  // is supplemented with an esports RSS feed and CS2's official app news.
-  return 753;
-}
-
-SOURCES[1].url = `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${SOURCES[1].appId}&count=20&maxlength=0`;
-
-const STATUS_URLS = [
-  { name: "Steam Store", url: "https://store.steampowered.com/" },
-  { name: "Steam Community", url: "https://steamcommunity.com/" },
-  { name: "Steam Web API", url: "https://api.steampowered.com/" },
-  { name: "Steam Status page", url: "https://steamstat.us/" },
-];
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fetchText(url, attempts = 3) {
   let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  for (let i = 1; i <= attempts; i++) {
     try {
-      const response = await fetch(url, {
-        headers: { "User-Agent": USER_AGENT, "Accept": "application/json, application/rss+xml, application/xml, text/xml, text/html, */*" },
-        signal: AbortSignal.timeout(15000),
+      const res = await fetch(url, {
+        headers: { "User-Agent": UA, "Accept": "text/html,application/json,*/*" },
+        signal: AbortSignal.timeout(18000)
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.text();
-    } catch (error) {
-      lastError = error;
-      if (attempt < attempts) await sleep(1000 * attempt);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    } catch (err) {
+      lastError = err;
+      if (i < attempts) await wait(1000 * i);
     }
   }
   throw lastError;
 }
 
+async function fetchJson(url) {
+  return JSON.parse(await fetchText(url));
+}
+
 async function loadState() {
-  try {
-    return JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
-  } catch {
-    return { initialized: false, seenNews: {}, status: {} };
-  }
+  try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); }
+  catch { return { initialized: false, changelists: {}, news: {} }; }
 }
 
 async function saveState(state) {
   await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
 }
 
-function decodeXml(value = "") {
-  return value
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
+function decodeHtml(s = "") {
+  return s.replace(/&amp;/g, "&").replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
     .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
-    .trim();
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
 }
 
-function parseRss(xml) {
-  const items = [];
-  const matches = xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
-  for (const item of matches) {
-    const get = (tag) => {
-      const match = item.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"));
-      return match ? decodeXml(match[1].replace(/<[^>]+>/g, "").trim()) : "";
-    };
-    const title = get("title");
-    const link = get("link");
-    const pubDate = get("pubDate");
-    if (title && link) items.push({ id: link, title, url: link, date: pubDate ? new Date(pubDate).toISOString() : new Date().toISOString() });
-  }
-  return items;
+function getChangelist(html) {
+  const text = decodeHtml(html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " "));
+  const match = text.match(/Last\s+Changenumber\s*:?\s*(\d{5,})/i);
+  if (!match) throw new Error("Could not read SteamDB changelist. SteamDB markup or access may have changed.");
+  return match[1];
 }
 
-async function getFeedItems(source) {
-  const text = await fetchText(source.url);
-  if (source.type === "steam") {
-    const data = JSON.parse(text);
-    return (data.appnews?.newsitems || []).map((item) => ({
-      id: String(item.gid || item.url),
-      title: item.title || "Untitled Steam announcement",
-      url: item.url,
-      date: item.date ? new Date(item.date * 1000).toISOString() : new Date().toISOString(),
-      contents: String(item.contents || "").replace(/<[^>]*>/g, "").slice(0, 300),
-    }));
-  }
-  return parseRss(text);
-}
-
-async function sendDiscord({ title, description, url, color = 0x66c0f4, footer = "Steam + CS2 Update Bot", timestamp }) {
+async function sendEmbed(embed) {
   const payload = {
-    username: "Steam + CS2 Updates",
+    username: "SteamDB Update Radar",
+    avatar_url: "https://store.steampowered.com/favicon.ico",
     allowed_mentions: { parse: [] },
     embeds: [{
-      title: String(title).slice(0, 256),
-      url,
-      description: String(description || "").slice(0, 4000) || "Open the link for details.",
-      color,
-      timestamp: timestamp || new Date().toISOString(),
-      footer: { text: footer },
-    }],
+      ...embed,
+      timestamp: new Date().toISOString(),
+      footer: {
+        text: "STEAMDB UPDATE RADAR • Checks every 5 minutes",
+        icon_url: "https://steamdb.info/favicon.ico"
+      }
+    }]
   };
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const response = await fetch(WEBHOOK_URL, {
+  for (let i = 1; i <= 3; i++) {
+    const res = await fetch(WEBHOOK, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+      headers: { "Content-Type": "application/json", "User-Agent": UA },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(15000)
     });
-    if (response.ok || response.status === 204) return;
-    const body = await response.text().catch(() => "");
-    if (response.status === 429 && attempt < 3) {
-      let delay = 2000;
-      try { delay = Math.ceil(Number(JSON.parse(body).retry_after || 2) * 1000); } catch {}
-      await sleep(Math.min(delay, 15000));
+    if (res.ok || res.status === 204) return;
+    const body = await res.text().catch(() => "");
+    if (res.status === 429 && i < 3) {
+      let ms = 2500;
+      try { ms = Math.ceil(Number(JSON.parse(body).retry_after || 2) * 1000); } catch {}
+      await wait(Math.min(ms, 20000));
       continue;
     }
-    if (response.status >= 500 && attempt < 3) {
-      await sleep(attempt * 1500);
-      continue;
-    }
-    throw new Error(`Discord webhook failed: HTTP ${response.status} ${body.slice(0, 250)}`);
+    if (res.status >= 500 && i < 3) { await wait(i * 1500); continue; }
+    throw new Error(`Discord HTTP ${res.status}: ${body.slice(0, 250)}`);
   }
 }
 
-async function processNews(state) {
-  for (const source of SOURCES) {
+async function checkSteamDB(state) {
+  for (const t of targets) {
     try {
-      const items = (await getFeedItems(source)).slice(0, MAX_NEWS_PER_FEED);
-      const known = new Set(state.seenNews[source.name] || []);
-      const fresh = items.filter((item) => !known.has(item.id)).reverse();
+      const current = getChangelist(await fetchText(t.db));
+      const previous = state.changelists[t.key];
 
-      // On first successful run, remember current stories without posting a backlog.
-      if (!state.initialized && FIRST_RUN_MODE === "seed") {
-        state.seenNews[source.name] = items.map((item) => item.id).slice(0, 200);
-        console.log(`[seed] ${source.name}: remembered ${items.length} existing stories`);
-        continue;
-      }
-
-      for (const item of fresh) {
-        await sendDiscord({
-          title: item.title,
-          description: item.contents || `New item from **${source.name}**.`,
-          url: item.url,
-          color: source.category.includes("Esports") ? 0xf1c40f : 0x66c0f4,
-          footer: source.category,
-          timestamp: item.date,
+      if (!previous) {
+        state.changelists[t.key] = current;
+        console.log(`[baseline] ${t.name}: #${current}`);
+      } else if (current !== previous) {
+        await sendEmbed({
+          title: `${t.emoji} ${t.name} — NEW STEAMDB CHANGE`,
+          url: t.db,
+          color: t.color,
+          description: [
+            `SteamDB detected a new changelist for **${t.name}**.`,
+            "",
+            `**Previous changelist:** \`#${previous}\``,
+            `**Current changelist:** \`#${current}\``,
+            "",
+            "A changelist can include backend, configuration, or content changes; it does not always mean a player-facing patch."
+          ].join("\n"),
+          fields: [
+            { name: "🔎 Patch notes", value: `[Open SteamDB patch notes](${t.db})`, inline: true },
+            { name: "🧾 Changelist history", value: `[Inspect history](${t.history})`, inline: true },
+            { name: "📣 Official news", value: `[Valve announcements](${t.official})`, inline: true }
+          ]
         });
-        console.log(`[posted] ${source.name}: ${item.title}`);
-        known.add(item.id);
-        await sleep(900); // avoid bursting webhook requests
+        state.changelists[t.key] = current;
+        console.log(`[alert] ${t.name}: ${previous} -> ${current}`);
+      } else {
+        console.log(`[unchanged] ${t.name}: #${current}`);
       }
-
-      state.seenNews[source.name] = [...known].slice(-200);
-    } catch (error) {
-      console.error(`[news error] ${source.name}: ${error.message}`);
+    } catch (err) {
+      console.error(`[SteamDB] ${t.name}: ${err.message}`);
     }
+    await wait(700);
   }
-  state.initialized = true;
 }
 
-async function processStatus(state) {
-  // This checks whether key Steam web services are reachable. It is not a direct
-  // measurement of CS2 matchmaking health or regional game-server quality.
-  for (const service of STATUS_URLS) {
-    let current = "up";
-    let detail = "HTTP response received";
+async function checkOfficialNews(state) {
+  for (const t of targets) {
+    const key = t.key;
     try {
-      const response = await fetch(service.url, {
-        method: "GET",
-        headers: { "User-Agent": USER_AGENT },
-        signal: AbortSignal.timeout(12000),
-      });
-      if (!response.ok) {
-        current = "degraded";
-        detail = `HTTP ${response.status}`;
-      }
-    } catch (error) {
-      current = "down";
-      detail = error.message;
-    }
+      const url = `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${t.appid}&count=10&maxlength=700`;
+      const data = await fetchJson(url);
+      const item = data.appnews?.newsitems?.[0];
+      if (!item) { console.log(`[news] No item returned for ${t.name}`); continue; }
 
-    const previous = state.status[service.name];
-    if (previous && previous !== current) {
-      await sendDiscord({
-        title: `${current === "up" ? "🟢 Recovered" : "🔴 Service issue"}: ${service.name}`,
-        description: `Status changed from **${previous}** to **${current}**.\nCheck: ${service.url}\nDetails: ${detail}`,
-        url: service.url,
-        color: current === "up" ? 0x2ecc71 : 0xe74c3c,
-        footer: "Basic reachability monitor — not official matchmaking status",
-      });
-      console.log(`[status] ${service.name}: ${previous} -> ${current}`);
-    } else if (!previous) {
-      console.log(`[status baseline] ${service.name}: ${current}`);
+      const id = String(item.gid || item.url || item.title);
+      const old = state.news[key];
+      if (!old) {
+        state.news[key] = id;
+        console.log(`[news baseline] ${t.name}: ${item.title}`);
+      } else if (id !== old) {
+        const summary = String(item.contents || "")
+          .replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n")
+          .replace(/<[^>]*>/g, "").replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim().slice(0, 1700);
+
+        await sendEmbed({
+          title: `📣 Official ${t.name} announcement`,
+          url: item.url || t.official,
+          color: t.color,
+          description: `${summary || "A new official Steam announcement was published."}\n\n[Read the original announcement](${item.url || t.official})`,
+          fields: [
+            { name: "SteamDB", value: `[Track ${t.name} on SteamDB](${t.db})`, inline: true },
+            { name: "Published", value: item.date ? `<t:${Number(item.date)}:R>` : "Recently", inline: true }
+          ]
+        });
+        state.news[key] = id;
+        console.log(`[official news] ${t.name}: ${item.title}`);
+      } else {
+        console.log(`[news unchanged] ${t.name}`);
+      }
+    } catch (err) {
+      console.error(`[official news] ${t.name}: ${err.message}`);
     }
-    state.status[service.name] = current;
+    await wait(700);
   }
 }
 
 async function main() {
   const state = await loadState();
-  await processNews(state);
-  await processStatus(state);
+  state.changelists ||= {};
+  state.news ||= {};
+  await checkSteamDB(state);
+  await checkOfficialNews(state);
+  state.initialized = true;
   await saveState(state);
-  console.log(`Run finished at ${new Date().toISOString()}`);
+  console.log(`Finished ${new Date().toISOString()}`);
 }
 
-main().catch((error) => {
-  console.error("Fatal run error:", error);
+main().catch(err => {
+  console.error("Fatal error:", err);
   process.exitCode = 1;
 });
