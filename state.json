@@ -72,5 +72,9 @@
     "Steam Community": "up",
     "Steam Web API": "degraded",
     "Steam Status page": "degraded"
+  },
+  "changelists": {},
+  "news": {
+    "cs2": "1846651706675829"
   }
 }
